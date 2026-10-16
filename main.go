@@ -1,39 +1,55 @@
 package main
 
 import (
-  "encoding/json"
-  "fmt"
-  "html/template"
-  "io"
-  "log"
-  "mime"
-  "net/http"
-  "net/url"
-  "os"
-  "path/filepath"
-  "regexp"
-  "strings"
-  "sync"
-  "time"
+	"encoding/json"
+	"fmt"
+	"html/template"
+	"io"
+	"log"
+	"mime"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
 )
 
 const (
-  dataDir = "/data"
-  ttl = 72 * time.Hour
-  maxBody = 100 << 20 // 100 MiB total
-  maxText = 2 << 20
+	ttl     = 72 * time.Hour
+	maxBody = 100 << 20 // 100 MiB total
+	maxText = 2 << 20
 )
 
 var (
-  codeRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$`)
-  mu sync.Mutex
-  reserved = map[string]bool{"create":true,"healthz":true,"favicon.ico":true,"robots.txt":true}
+	dataDir  = envDefault("PASTE_DATA_DIR", "./data")
+	codeRE   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{1,63}$`)
+	mu       sync.Mutex
+	reserved = map[string]bool{"create": true, "healthz": true, "favicon.ico": true, "robots.txt": true}
 )
 
-type FileMeta struct { Stored, Name string; Size int64; Type string }
-type Meta struct { Code string `json:"code"`; Text string `json:"text"`; CreatedAt time.Time `json:"created_at"`; ExpiresAt time.Time `json:"expires_at"`; Files []FileMeta `json:"files"` }
+type FileMeta struct {
+	Stored, Name string
+	Size         int64
+	Type         string
+}
+type Meta struct {
+	Code      string     `json:"code"`
+	Text      string     `json:"text"`
+	CreatedAt time.Time  `json:"created_at"`
+	ExpiresAt time.Time  `json:"expires_at"`
+	Files     []FileMeta `json:"files"`
+}
 
-type PageData struct { Exists bool; Code, Text string; Files []FileMeta; Expires string; Error string }
+type PageData struct {
+	Exists     bool
+	Code, Text string
+	Files      []FileMeta
+	Expires    string
+	Error      string
+}
 
 var page = template.Must(template.New("p").Parse(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{if .Code}}{{.Code}} - {{end}}PasteCrate</title><style>
 :root{color-scheme:light dark;--bg:#f7f7f8;--card:#fff;--fg:#18181b;--muted:#71717a;--line:#e4e4e7;--acc:#5b5bd6;--danger:#dc2626}@media(prefers-color-scheme:dark){:root{--bg:#111113;--card:#18181b;--fg:#f4f4f5;--muted:#a1a1aa;--line:#303036;--acc:#7c7cf0}}
@@ -128,72 +144,207 @@ var page = template.Must(template.New("p").Parse(`<!doctype html><html><head><me
 })();
 </script></body></html>`))
 
-func codeDir(code string) string { return filepath.Join(dataDir, code) }
-func metaPath(code string) string { return filepath.Join(codeDir(code), "meta.json") }
-func validCode(code string) bool { return codeRE.MatchString(code) && !reserved[strings.ToLower(code)] }
-
-func load(code string) (*Meta,error) {
-  b,err:=os.ReadFile(metaPath(code)); if err!=nil{return nil,err}
-  var m Meta; if err=json.Unmarshal(b,&m); err!=nil{return nil,err}
-  if time.Now().After(m.ExpiresAt){ _=os.RemoveAll(codeDir(code)); return nil,os.ErrNotExist }
-  return &m,nil
+func envDefault(key, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
+	}
+	return fallback
 }
-func save(m *Meta) error { b,_:=json.MarshalIndent(m,"","  "); return os.WriteFile(metaPath(m.Code),b,0640) }
-func render(w http.ResponseWriter,d PageData){ w.Header().Set("Cache-Control","no-store"); if err:=page.Execute(w,d);err!=nil{log.Print(err)} }
 
-func root(w http.ResponseWriter,r *http.Request){
-  if r.URL.Path!="/" { http.NotFound(w,r); return }
-  render(w,PageData{})
+func codeDir(code string) string  { return filepath.Join(dataDir, code) }
+func metaPath(code string) string { return filepath.Join(codeDir(code), "meta.json") }
+func validCode(code string) bool  { return codeRE.MatchString(code) && !reserved[strings.ToLower(code)] }
+
+func load(code string) (*Meta, error) {
+	b, err := os.ReadFile(metaPath(code))
+	if err != nil {
+		return nil, err
+	}
+	var m Meta
+	if err = json.Unmarshal(b, &m); err != nil {
+		return nil, err
+	}
+	if time.Now().After(m.ExpiresAt) {
+		_ = os.RemoveAll(codeDir(code))
+		return nil, os.ErrNotExist
+	}
+	return &m, nil
+}
+func save(m *Meta) error {
+	b, _ := json.MarshalIndent(m, "", "  ")
+	return os.WriteFile(metaPath(m.Code), b, 0640)
+}
+func render(w http.ResponseWriter, d PageData) {
+	w.Header().Set("Cache-Control", "no-store")
+	if err := page.Execute(w, d); err != nil {
+		log.Print(err)
+	}
+}
+
+func root(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	render(w, PageData{})
 }
 func createResponse(w http.ResponseWriter, r *http.Request, code, message string, status int) {
-  if r.Header.Get("X-Requested-With") == "XMLHttpRequest" {
-    w.Header().Set("Content-Type", "application/json; charset=utf-8")
-    w.Header().Set("Cache-Control", "no-store")
-    if message != "" {
-      w.WriteHeader(status)
-      _ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": message})
-    } else {
-      _ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "url": "/" + url.PathEscape(code)})
-    }
-    return
-  }
-  if message != "" {
-    if status >= 500 { http.Error(w, message, status) } else { render(w, PageData{Error:message}) }
-    return
-  }
-  http.Redirect(w, r, "/" + url.PathEscape(code), http.StatusSeeOther)
+	if r.Header.Get("X-Requested-With") == "XMLHttpRequest" {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		if message != "" {
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": false, "error": message})
+		} else {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "url": "/" + url.PathEscape(code)})
+		}
+		return
+	}
+	if message != "" {
+		if status >= 500 {
+			http.Error(w, message, status)
+		} else {
+			render(w, PageData{Error: message})
+		}
+		return
+	}
+	http.Redirect(w, r, "/"+url.PathEscape(code), http.StatusSeeOther)
 }
 
-func create(w http.ResponseWriter,r *http.Request){
-  if r.Method!=http.MethodPost { http.Error(w,"method",405); return }
-  r.Body=http.MaxBytesReader(w,r.Body,maxBody)
-  if err:=r.ParseMultipartForm(8 << 20); err!=nil { createResponse(w,r,"","Upload too large or invalid.",413); return }
-  code:=strings.TrimSpace(r.FormValue("code")); if !validCode(code){ createResponse(w,r,"","Invalid code. Use 2–64 letters, numbers, - or _.",400); return }
-  text:=r.FormValue("text"); if len(text)>maxText { createResponse(w,r,"","Text is too large.",413); return }
-  mu.Lock(); defer mu.Unlock()
-  if _,err:=load(code); err==nil { createResponse(w,r,"","That code already exists. Pick another one.",409); return }
-  dir:=codeDir(code); if err:=os.MkdirAll(filepath.Join(dir,"files"),0750);err!=nil{createResponse(w,r,"","Storage error. Please retry.",500);return}
-  m:=&Meta{Code:code,Text:text,CreatedAt:time.Now().UTC(),ExpiresAt:time.Now().UTC().Add(ttl)}
-  for _,fh:=range r.MultipartForm.File["files"]{
-    src,err:=fh.Open(); if err!=nil{continue}
-    clean:=filepath.Base(fh.Filename); if clean=="."||clean==""{src.Close();continue}
-    stored:=fmt.Sprintf("%d-%s",len(m.Files),clean)
-    dst,err:=os.Create(filepath.Join(dir,"files",stored)); if err!=nil{src.Close();continue}
-    n,err:=io.Copy(dst,src); src.Close(); dst.Close(); if err!=nil{continue}
-    typ:=fh.Header.Get("Content-Type"); if typ==""{typ=mime.TypeByExtension(filepath.Ext(clean))}
-    m.Files=append(m.Files,FileMeta{Stored:stored,Name:clean,Size:n,Type:typ})
-  }
-  if strings.TrimSpace(text)=="" && len(m.Files)==0 { _=os.RemoveAll(dir); createResponse(w,r,"","Add some text or at least one file.",400); return }
-  if err:=save(m);err!=nil{_ = os.RemoveAll(dir);createResponse(w,r,"","Storage error. Please retry.",500);return}
-  createResponse(w,r,code,"",0)
+func create(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", 405)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+	if err := r.ParseMultipartForm(8 << 20); err != nil {
+		createResponse(w, r, "", "Upload too large or invalid.", 413)
+		return
+	}
+	code := strings.TrimSpace(r.FormValue("code"))
+	if !validCode(code) {
+		createResponse(w, r, "", "Invalid code. Use 2–64 letters, numbers, - or _.", 400)
+		return
+	}
+	text := r.FormValue("text")
+	if len(text) > maxText {
+		createResponse(w, r, "", "Text is too large.", 413)
+		return
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if _, err := load(code); err == nil {
+		createResponse(w, r, "", "That code already exists. Pick another one.", 409)
+		return
+	}
+	dir := codeDir(code)
+	if err := os.MkdirAll(filepath.Join(dir, "files"), 0750); err != nil {
+		createResponse(w, r, "", "Storage error. Please retry.", 500)
+		return
+	}
+	m := &Meta{Code: code, Text: text, CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(ttl)}
+	for _, fh := range r.MultipartForm.File["files"] {
+		src, err := fh.Open()
+		if err != nil {
+			continue
+		}
+		clean := filepath.Base(fh.Filename)
+		if clean == "." || clean == "" {
+			src.Close()
+			continue
+		}
+		stored := fmt.Sprintf("%d-%s", len(m.Files), clean)
+		dst, err := os.Create(filepath.Join(dir, "files", stored))
+		if err != nil {
+			src.Close()
+			continue
+		}
+		n, err := io.Copy(dst, src)
+		src.Close()
+		dst.Close()
+		if err != nil {
+			continue
+		}
+		typ := fh.Header.Get("Content-Type")
+		if typ == "" {
+			typ = mime.TypeByExtension(filepath.Ext(clean))
+		}
+		m.Files = append(m.Files, FileMeta{Stored: stored, Name: clean, Size: n, Type: typ})
+	}
+	if strings.TrimSpace(text) == "" && len(m.Files) == 0 {
+		_ = os.RemoveAll(dir)
+		createResponse(w, r, "", "Add some text or at least one file.", 400)
+		return
+	}
+	if err := save(m); err != nil {
+		_ = os.RemoveAll(dir)
+		createResponse(w, r, "", "Storage error. Please retry.", 500)
+		return
+	}
+	createResponse(w, r, code, "", 0)
 }
-func view(w http.ResponseWriter,r *http.Request){
-  parts:=strings.Split(strings.Trim(r.URL.Path,"/"),"/"); if len(parts)==0||!validCode(parts[0]){http.NotFound(w,r);return}; code:=parts[0]
-  m,err:=load(code); if err!=nil{http.NotFound(w,r);return}
-  if len(parts)==1 { render(w,PageData{Exists:true,Code:code,Text:m.Text,Files:m.Files,Expires:m.ExpiresAt.Local().Format("Jan 2, 15:04")}); return }
-  if len(parts)==3 && parts[1]=="file" { name,_:=url.PathUnescape(parts[2]); for _,f:=range m.Files{if f.Name==name{w.Header().Set("Content-Disposition",fmt.Sprintf("attachment; filename*=UTF-8''%s",url.PathEscape(f.Name))); if f.Type!=""{w.Header().Set("Content-Type",f.Type)}; http.ServeFile(w,r,filepath.Join(codeDir(code),"files",f.Stored)); return}} }
-  if len(parts)==2 && parts[1]=="delete" && r.Method==http.MethodPost { _=os.RemoveAll(codeDir(code)); http.Redirect(w,r,"/",http.StatusSeeOther); return }
-  http.NotFound(w,r)
+func view(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) == 0 || !validCode(parts[0]) {
+		http.NotFound(w, r)
+		return
+	}
+	code := parts[0]
+	m, err := load(code)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if len(parts) == 1 {
+		render(w, PageData{Exists: true, Code: code, Text: m.Text, Files: m.Files, Expires: m.ExpiresAt.Local().Format("Jan 2, 15:04")})
+		return
+	}
+	if len(parts) == 3 && parts[1] == "file" {
+		name, _ := url.PathUnescape(parts[2])
+		for _, f := range m.Files {
+			if f.Name == name {
+				w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename*=UTF-8''%s", url.PathEscape(f.Name)))
+				if f.Type != "" {
+					w.Header().Set("Content-Type", f.Type)
+				}
+				http.ServeFile(w, r, filepath.Join(codeDir(code), "files", f.Stored))
+				return
+			}
+		}
+	}
+	if len(parts) == 2 && parts[1] == "delete" && r.Method == http.MethodPost {
+		_ = os.RemoveAll(codeDir(code))
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	http.NotFound(w, r)
 }
-func cleanup(){ for{ entries,_:=os.ReadDir(dataDir); for _,e:=range entries{if e.IsDir(){_,_=load(e.Name())}}; time.Sleep(15*time.Minute)} }
-func main(){ _=os.MkdirAll(dataDir,0750); go cleanup(); http.HandleFunc("/healthz",func(w http.ResponseWriter,r *http.Request){io.WriteString(w,"OK")}); http.HandleFunc("/create",create); http.HandleFunc("/",func(w http.ResponseWriter,r *http.Request){if r.URL.Path=="/"{root(w,r)}else{view(w,r)}}); log.Println("pastecrate listening on :8080"); log.Fatal(http.ListenAndServe(":8080",nil)) }
+func cleanup() {
+	for {
+		entries, _ := os.ReadDir(dataDir)
+		for _, e := range entries {
+			if e.IsDir() {
+				_, _ = load(e.Name())
+			}
+		}
+		time.Sleep(15 * time.Minute)
+	}
+}
+func main() {
+	if err := os.MkdirAll(dataDir, 0750); err != nil {
+		log.Fatalf("cannot create data directory %q: %v", dataDir, err)
+	}
+	addr := envDefault("PASTE_LISTEN_ADDR", ":8080")
+	go cleanup()
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "OK") })
+	http.HandleFunc("/create", create)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			root(w, r)
+		} else {
+			view(w, r)
+		}
+	})
+	log.Printf("pastecrate listening on %s; data directory: %s", addr, dataDir)
+	log.Fatal(http.ListenAndServe(addr, nil))
+}
