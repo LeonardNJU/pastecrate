@@ -1,0 +1,12 @@
+services:
+  pastecrate:
+    build: .
+    image: pastecrate:local
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - paste_data:/data
+
+volumes:
+  paste_data:

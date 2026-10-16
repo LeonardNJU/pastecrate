@@ -1,0 +1,9 @@
+# NEVER check in actual uploaded pastes or user files.
+data/
+*.bak
+*.bak-*
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
